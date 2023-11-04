@@ -12,47 +12,92 @@
 #include <wordexp.h>
 #include <dirent.h>
 
-#include "djb2.c"
+#include "utils.h"
+#include "djb2.h"
 
-#define PORT 8080
 #define WELCOME_MSG "Welcome to file transfer server\n"
-#define DATA_FOLDER "data/"
-#define BSIZE 4096
+#define DATA_FOLDER "data"
+#define DATA_FOLDER_LEN 4
 #define MAX_CLIENTS 30
 
-int main(int argc, char *argv[]) {
+void list_dir(DIR* d, int sd, char* buffer) {
+    struct dirent *dir = NULL;
+    buffer[0] = 0;
+    while ((dir = readdir(d)) != NULL)
+        if (dir->d_type == DT_REG)
+            strcat(buffer, strcat(dir->d_name, "\n"));
+    rewinddir(d);
+    send_wrapper(sd, buffer, 0);
+}
+
+void send_file(char* name, char* path, char* buffer, int sd) {
+    bool result = false;
+    if (strcmp(name, "..") == 0 || strcmp(name, ".") == 0) {
+        send(sd, &result, sizeof(bool), 0);
+        send_wrapper(sd, "Invalid filename\n", 0);
+        return;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        send(sd, &result, sizeof(bool), 0);
+        send_wrapper(sd, "File not found\n", 0);
+    } else {
+        result = 1;
+        send(sd, &result, sizeof(bool), 0);
+        send_wrapper(sd, name, 0);
+        fseek(fp, 0, SEEK_END);
+        size_t size = ftell(fp);
+        rewind(fp);
+        send(sd, &size, sizeof(size_t), 0);
+        size_t length = 0;
+        while ((length = fread(buffer, 1, BSIZE, fp)) > 0) {
+            send(sd, buffer, length, 0);
+        }
+        fclose(fp);
+    }
+}
+
+void get(char* filename, char* path_buffer, char* data_buffer, int sd) {
+    int length = DATA_FOLDER_LEN + strlen(filename) + 2;
+    if (path_buffer)
+        path_buffer = realloc(path_buffer, length * sizeof(char));
+    else
+        path_buffer = malloc(length * sizeof(char));
+    snprintf(path_buffer, length, "%s/%s", DATA_FOLDER, filename);
+    send_file(filename, path_buffer, data_buffer, sd);
+}
+
+int main() {
     int opt = true;
     int master_socket, addrlen, new_socket, activity, i, valread, sd;
     int client_socket[MAX_CLIENTS];
-    DIR* sessions[MAX_CLIENTS];
     int max_sd, portno, req_ret;
     struct sockaddr_in address;
-    char *filename, *filepath = NULL, *workdirs[MAX_CLIENTS];
+    char *filename = NULL;
     wordexp_t args_request;
-    struct dirent *dir;
+    struct dirent *dir = NULL;
     char buffer[BSIZE + 1];
+    DIR* d;
 
     // set of socket descriptors
     fd_set readfds;
 
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        sessions[i] = NULL;
+    for (int i = 0; i < MAX_CLIENTS; i++)
         client_socket[i] = 0;
-        workdirs[i] = NULL;
+    
+    d = opendir(DATA_FOLDER);
+    if (d == NULL) {
+        fprintf(stderr, "Could not open data folder\n");
+        exit(EXIT_FAILURE);
     }
 
     // create a master socket
-    if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+        serr("socket failed\n");
 
     // set master socket to allow multiple connections ,
-    // this is just a good habit, it will work without this
-    if (setsockopt(master_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+    if (setsockopt(master_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0)
+        serr("setsockopt failed\n");
 
     // type of socket created
     address.sin_family = AF_INET;
@@ -60,17 +105,14 @@ int main(int argc, char *argv[]) {
     address.sin_port = htons(PORT);
 
     // bind the socket to localhost `PORT`
-    if (bind(master_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
+    if (bind(master_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
+        serr("bind failed\n");
+
     printf("Listener on port %d \n", PORT);
 
     // try to specify maximum of 3 pending connections for the master socket
-    if (listen(master_socket, 3) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
+    if (listen(master_socket, 3) < 0)
+        serr("listen failed\n");
 
     // accept the incoming connection
     addrlen = sizeof(address);
@@ -98,28 +140,21 @@ int main(int argc, char *argv[]) {
                 max_sd = sd;
         }
 
-        // wait for an activity on one of the sockets , timeout is NULL ,
-        // so wait indefinitely
+        // wait for an activity on one of the sockets, timeout is NULL, so wait indefinitely
         activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
 
         if ((activity < 0) && (errno != EINTR))
             fprintf(stderr, "select error");
 
-        // If something happened on the master socket ,
-        // then its an incoming connection
+        // If something happened on the master socket, then its an incoming connection
         if (FD_ISSET(master_socket, &readfds)) {
-            if ((new_socket = accept(master_socket, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
-                perror("accept");
-                exit(EXIT_FAILURE);
-            }
+            if ((new_socket = accept(master_socket, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0)
+                serr("accept failed\n");
 
             // inform user of socket number - used in send and receive commands
             printf("INFO: New connection , socket fd is %d , ip is : %s , port : %d\n", new_socket, inet_ntoa(address.sin_addr), ntohs(address.sin_port));
 
-            // send new connection greeting message
-            if (send(new_socket, WELCOME_MSG, strlen(WELCOME_MSG), 0) != strlen(WELCOME_MSG)) {
-                perror("send");
-            }
+            send_wrapper(new_socket, WELCOME_MSG, 0);
 
             // add new socket to array of sockets
             for (i = 0; i < MAX_CLIENTS; i++) {
@@ -127,16 +162,7 @@ int main(int argc, char *argv[]) {
                 if (client_socket[i] == 0)
                 {
                     client_socket[i] = new_socket;
-                    if (!(sessions[i] = opendir(DATA_FOLDER))) {
-                        fprintf(stderr, "Cannot open directory '%s'\n", DATA_FOLDER);
-                        exit(EXIT_FAILURE);
-                    }
-                    if (workdirs[i] == NULL)
-                        workdirs[i] = (char *) malloc((strlen(DATA_FOLDER) + 1) * sizeof(char));
-                    else
-                        workdirs[i] = (char *) realloc(workdirs[i], (strlen(DATA_FOLDER) + 1) * sizeof(char));
-                    strcpy(workdirs[i], DATA_FOLDER);
-                    printf("DEBUG: Adding to list of sockets as %d\n", i);
+                    printf("Adding to list of sockets as %d\n", i);
                     break;
                 }
             }
@@ -165,66 +191,29 @@ int main(int argc, char *argv[]) {
                     }
                     buffer[valread] = '\0';
                     req_ret = wordexp(buffer, &args_request, 0);
-                    printf("DEBUG: Request: %s\n", buffer);
+                    printf("Request: %s\n", buffer);
                     if (req_ret == 0) {
-                        if (args_request.we_wordc == 0)
+                        if (args_request.we_wordc == 0) {
+                            send_wrapper(sd, "Specify a command\n", 0);
                             continue;
+                        }
                         switch (hash(args_request.we_wordv[0])) {
                             case HASH_LS:
-                                while ((dir = readdir(sessions[i])) != NULL)
-                                    send(sd, strcat(dir->d_name, "\n"), strlen(dir->d_name) + 1, 0);
-                                rewinddir(sessions[i]);
+                                list_dir(d, sd, buffer);
                                 break;
                             case HASH_GET:
                                 if (args_request.we_wordc < 2) {
-                                    send(sd, "Specify a filename\n", strlen("Specify a filename\n"), 0);
-                                } else {
-                                    filename = args_request.we_wordv[1];
-                                     if (filepath)
-                                        filepath = (char *) realloc(filepath, (strlen(workdirs[i]) + strlen(filename) + 1) * sizeof(char));
-                                    else
-                                        filepath = (char *) malloc((strlen(workdirs[i]) + strlen(filename) + 1) * sizeof(char));
-                                    strcpy(filepath, workdirs[i]);
-                                    strcat(filepath, filename);
-                                    FILE *fp = fopen(filepath, "rb");
-                                    if (fp == NULL) {
-                                        send(sd, "File not found\n", strlen("File not found\n"), 0);
-                                    } else {
-                                        fseek(fp, 0L, SEEK_END);
-                                        int sz = ftell(fp);
-                                        rewind(fp);
-                                        char *filedata = malloc(sz);
-                                        fread(filedata, sz, 1, fp);
-                                        fclose(fp);
-                                        send(sd, filedata, sz, 0);
-                                    }
+                                    bool result = false;
+                                    send(sd, &result, sizeof(bool), 0);
+                                    send_wrapper(sd, "Specify a filename\n", 0);
                                 }
+                                else
+                                    get(args_request.we_wordv[1], filename, buffer, sd);
                                 break;
-                            case HASH_CD:
-                                if (args_request.we_wordc < 2) {
-                                    send(sd, "Specify a directory\n", strlen("Specify a directory\n"), 0);
-                                } else {
-                                    filename = args_request.we_wordv[1];
-                                    if (strcmp(workdirs[i], DATA_FOLDER) == 0 && strcmp(filename, "..") == 0) {
-                                        send(sd, "Cannot go back\n", strlen("Cannot go back\n"), 0);
-                                    } else {
-                                        size_t new_length = strlen(workdirs[i]) + strlen(filename) + 2;
-                                        workdirs[i] = (char *) realloc(workdirs[i], new_length * sizeof(char));
-                                        strcat(workdirs[i], "/");
-                                        strcat(workdirs[i], filename);
-                                        if (sessions[i] = opendir(workdirs[i])) {
-                                            send(sd, "Directory changed\n", strlen("Directory changed\n"), 0);
-                                        } else {
-                                            send(sd, "Directory not found\n", strlen("Directory not found\n"), 0);
-                                            new_length = strlen(workdirs[i]) - strlen(filename) + 1;
-                                            workdirs[i] = (char *) realloc(workdirs[i], new_length * sizeof(char));
-                                            workdirs[new_length] = '\0';
-                                        }
-                                    }
-                                }
-                                break;
+                            case HASH_EXIT:
+                                send_wrapper(sd, "Goodbye\n", 0);
                             default:
-                                send(sd, "Unknown command", strlen("Unknown command"), 0);
+                                send_wrapper(sd, "Unknown command\n", 0);
                                 break;
                         }
                     } else {
@@ -237,11 +226,8 @@ int main(int argc, char *argv[]) {
     }
     wordfree(&args_request);
     free(filename);
+    free(dir);
+    free(d);
     close(master_socket);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (sessions[i])
-            closedir(sessions[i]);
-        free(workdirs[i]);
-    }
     return 0;
 }
